@@ -1,4 +1,4 @@
-﻿#!/usr/bin/env python3
+#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
 Ядро упаковщика архивов для S.T.A.L.K.E.R. ОП-2.1 (.dbz)
@@ -18,7 +18,7 @@ DB_CHUNK_DATA_STD = 0x00000000
 DB_CHUNK_HEADER_STD = 0x00000001
 DB_CHUNK_OP_2_1_DATA = 0x00000309
 DB_CHUNK_OP_2_1_HEADER = 0x0000030A
-
+CFS_COMPRESS_MARK = 0x80000000
 # Точный список расширений, которые шифруются в архивах ОП-2.1 (извлечён из xrCore.dll)
 OP21_ENCRYPTED_EXTS = {
     ".ltx",
@@ -138,6 +138,60 @@ class NativeXRScrambler:
         return enc_buf.raw
 
 
+class NativeXRCompressor:
+    """Сжимает таблицу файлов через родной IWriter::w_compressed из xrCore.dll ОП-2.1."""
+
+    def __init__(self, dll: ctypes.WinDLL, core_initialized: bool = False):
+        self.dll = dll
+        VirtualAlloc = ctypes.windll.kernel32.VirtualAlloc
+        VirtualAlloc.restype = ctypes.c_void_p
+
+        def make_thiscall(fn_addr: int, argtypes, restype=None):
+            code = b"\x58\x59\x50\xB8" + fn_addr.to_bytes(4, "little") + b"\xFF\xE0"
+            buf = VirtualAlloc(0, len(code), 0x3000, 0x40)
+            ctypes.memmove(buf, code, len(code))
+            return ctypes.WINFUNCTYPE(restype, ctypes.c_void_p, *argtypes)(buf)
+
+        if not core_initialized:
+            # Инициализируем xrMemory (достаточно для CMemoryWriter и w_compressed)
+            mem_obj = ctypes.cast(getattr(dll, "?Memory@@3VxrMemory@@A"), ctypes.c_void_p).value
+            mem_init_addr = ctypes.cast(getattr(dll, "?_initialize@xrMemory@@QAEXH@Z"), ctypes.c_void_p).value
+            mem_init = make_thiscall(mem_init_addr, [ctypes.c_int])
+            mem_init(mem_obj, 0)
+
+        self._ctor = make_thiscall(
+            ctypes.cast(getattr(dll, "??0CMemoryWriter@@QAE@XZ"), ctypes.c_void_p).value, []
+        )
+        self._dtor = make_thiscall(
+            ctypes.cast(getattr(dll, "??1CMemoryWriter@@UAE@XZ"), ctypes.c_void_p).value, []
+        )
+        self._w_comp = make_thiscall(
+            ctypes.cast(getattr(dll, "?w_compressed@IWriter@@QAEXPAXI@Z"), ctypes.c_void_p).value,
+            [ctypes.c_void_p, ctypes.c_uint32],
+        )
+        self._ptr = make_thiscall(
+            ctypes.cast(getattr(dll, "?pointer@CMemoryWriter@@QAEPAEXZ"), ctypes.c_void_p).value,
+            [],
+            ctypes.c_void_p,
+        )
+        self._size = make_thiscall(
+            ctypes.cast(getattr(dll, "?size@CMemoryWriter@@QBEIXZ"), ctypes.c_void_p).value,
+            [],
+            ctypes.c_uint32,
+        )
+
+    def compress_bytes(self, data: bytes) -> bytes:
+        writer_obj = ctypes.create_string_buffer(256)
+        self._ctor(writer_obj)
+        try:
+            self._w_comp(writer_obj, data, len(data))
+            out_size = self._size(writer_obj)
+            out_ptr = self._ptr(writer_obj)
+            return ctypes.string_at(out_ptr, out_size)
+        finally:
+            self._dtor(writer_obj)
+
+
 @dataclass
 class ArchiveEntry:
     rel_path: str
@@ -185,6 +239,7 @@ def pack_op21_archive(
         raise ValueError("Выбранная папка пуста — нет файлов для упаковки.")
 
     scrambler = NativeXRScrambler() if mode == "op21_dbz" else None
+    compressor = NativeXRCompressor(scrambler.dll) if mode == "op21_dbz" else None
 
     total_files = len(files)
     max_bytes = max_volume_mb * 1024 * 1024 if max_volume_mb > 0 else 0
@@ -265,8 +320,10 @@ def pack_op21_archive(
             raw_table = build_header_table(entries)
 
             if mode == "op21_dbz":
-                f.write(struct.pack("<II", DB_CHUNK_OP_2_1_HEADER, len(raw_table)))
-                f.write(raw_table)
+                comp_table = compressor.compress_bytes(raw_table)
+                enc_table = scrambler.encrypt_bytes(comp_table)
+                f.write(struct.pack("<II", DB_CHUNK_OP_2_1_HEADER | CFS_COMPRESS_MARK, len(enc_table)))
+                f.write(enc_table)
             else:
                 f.write(struct.pack("<II", DB_CHUNK_HEADER_STD, len(raw_table)))
                 f.write(raw_table)
