@@ -216,7 +216,22 @@ def collect_files(src_dir: str) -> List[Tuple[str, str]]:
 
 def build_header_table(entries: List[ArchiveEntry]) -> bytes:
     buf = bytearray()
+    seen_dirs = set()
+
     for e in entries:
+        dir_name = os.path.dirname(e.rel_path)
+        # Записываем только подпапки (2-й уровень и глубже, где есть '\' в dir_name),
+        # пропуская корневые папки 1-го уровня ('config', 'scripts' и т.д.)
+        if dir_name and "\\" in dir_name:
+            dir_entry_path = dir_name + "\\"
+            if dir_entry_path not in seen_dirs:
+                seen_dirs.add(dir_entry_path)
+                dir_bytes = dir_entry_path.encode("cp1251", errors="replace")
+                dir_entry_size = 16 + len(dir_bytes)
+                buf.extend(struct.pack("<HIII", dir_entry_size, 0, 0, 0))
+                buf.extend(dir_bytes)
+                buf.extend(struct.pack("<I", 0))
+
         path_bytes = e.rel_path.encode("cp1251", errors="replace")
         entry_size = 16 + len(path_bytes)
         buf.extend(struct.pack("<HIII", entry_size, e.real_size, e.comp_size, e.crc32))
